@@ -1,0 +1,19 @@
+{
+  "name": "CA Muktyar Ahmad & Co — CA Firm Workspace",
+  "short_name": "CA Muktyar Ahmad & Co",
+  "description": "Manage clients, tasks and your CA firm on the go.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f4f7fb",
+  "theme_color": "#173b64",
+  "icons": [
+    {
+      "src": "/icons/ca-muktyar-ahmad-co.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

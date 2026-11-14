@@ -1,0 +1,10 @@
+.env
+.firmdesk-auth.json
+
+.ca-auth-users.json
+.ca-workspace.json
+
+# Generated and local-only files
+node_modules/
+dist/
+.DS_Store
