@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { setServers } from 'node:dns';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -15,7 +16,9 @@ try {
   if (name.length < 2 || !/^[a-z0-9][a-z0-9._-]{2,31}$/.test(username) || password.length < 12 || !/[a-z]/i.test(password) || !/\d/.test(password)) throw new Error('Invalid input. Name, username format, and password requirements were not met.');
   const passwordHash = await bcrypt.hash(password, 12);
   if (process.env.MONGODB_URI) {
-    await mongoose.connect(process.env.MONGODB_URI);
+    const mongoDnsServers = (process.env.MONGODB_DNS_SERVERS || '').split(',').map(server => server.trim()).filter(Boolean);
+    if (mongoDnsServers.length) setServers(mongoDnsServers);
+    await mongoose.connect(process.env.MONGODB_URI.trim());
     const User = mongoose.model('User', new mongoose.Schema({ name: String, username: { type: String, unique: true }, passwordHash: String, role: String, accountStatus: String, mustChangePassword: Boolean, jobTitle: String, clientId: mongoose.Schema.Types.ObjectId, clientName: String, lastLoginAt: Date }, { timestamps: true }));
     if (await User.exists({ username })) throw new Error('That username is already registered.');
     await User.create({ name, username, passwordHash, role: 'admin', accountStatus: 'active', mustChangePassword: false, jobTitle: 'CA Owner' });

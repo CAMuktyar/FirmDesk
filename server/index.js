@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { setServers } from 'node:dns';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -54,7 +55,7 @@ const User = schema('User', {
   passwordHash: { type: String, required: true, select: false },
   role: { type: String, enum: ['admin', 'staff', 'client'], required: true, index: true },
   accountStatus: { type: String, enum: ['active', 'inactive'], default: 'active', index: true },
-  mustChangePassword: { type: Boolean, default: true },
+  mustChangePassword: { type: Boolean, default: false },
   sessionVersion: { type: Number, default: 0 },
   jobTitle: { type: String, trim: true, maxlength: 80, default: '' },
   clientId: { type: mongoose.Schema.Types.ObjectId, ref: 'ClientProfile', default: null, index: true },
@@ -112,13 +113,17 @@ async function atomicWrite(file, value) {
   await fs.chmod(file, 0o600).catch(() => {});
 }
 const mongoReady = () => mongoose.connection.readyState === 1;
+const safeMongoError = error => String(error?.message || error).replace(/(mongodb(?:\+srv)?:\/\/)[^\s@]+@/gi, '$1[REDACTED]@');
+mongoose.connection.on('error', error => console.error('MongoDB connection error:', safeMongoError(error)));
+mongoose.connection.on('disconnected', () => console.error('MongoDB disconnected.'));
 const db = (req, res, next) => mongoReady() ? next() : res.status(503).json({ error: 'Database unavailable. Configure MONGODB_URI to use database-backed tasks and conversations.' });
 const normalizeUsername = value => String(value || '').trim().toLowerCase();
+const usernameRegex = value => new RegExp(`^${normalizeUsername(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i');
 const userId = user => String(user._id || user.id);
-const publicUser = user => ({ id: userId(user), name: user.name, username: user.username, role: user.role, accountStatus: user.accountStatus, mustChangePassword: Boolean(user.mustChangePassword), jobTitle: user.jobTitle || '', clientId: user.clientId ? String(user.clientId) : null, clientName: user.clientName || '', lastLoginAt: user.lastLoginAt || null });
+const publicUser = user => ({ id: userId(user), name: user.name, username: user.username, role: user.role, accountStatus: user.accountStatus, mustChangePassword: user.role === 'staff' ? false : Boolean(user.mustChangePassword), jobTitle: user.jobTitle || '', clientId: user.clientId ? String(user.clientId) : null, clientName: user.clientName || '', lastLoginAt: user.lastLoginAt || null });
 async function findUserByUsername(username) {
-  if (mongoReady()) return User.findOne({ username: normalizeUsername(username) }).select('+passwordHash').lean();
-  return (await readJson(authFile, [])).find(user => user.username === normalizeUsername(username)) || null;
+  if (mongoReady()) return (await User.findOne({ username: normalizeUsername(username) }).select('+passwordHash').lean()) || User.findOne({ username: usernameRegex(username) }).select('+passwordHash').lean();
+  return (await readJson(authFile, [])).find(user => normalizeUsername(user.username) === normalizeUsername(username)) || null;
 }
 async function findUserById(id) {
   if (mongoReady()) return User.findById(id).select('+passwordHash').lean();
@@ -210,7 +215,7 @@ const auth = ({ allowPasswordChange = false } = {}) => async (req, res, next) =>
     const user = await findUserById(claims.sub);
     if (!user || Number(claims.ver || 0) !== Number(user.sessionVersion || 0) || user.accountStatus !== 'active') { clearSessionCookie(res); return res.status(401).json({ error: 'Account inactive or session expired.' }); }
     req.user = { ...publicUser(user), passwordHash: user.passwordHash };
-    if (user.mustChangePassword && !allowPasswordChange) return res.status(403).json({ error: 'Change your temporary password before continuing.', code: 'PASSWORD_CHANGE_REQUIRED' });
+    if (user.mustChangePassword && user.role !== 'staff' && !allowPasswordChange) return res.status(403).json({ error: 'Change your temporary password before continuing.', code: 'PASSWORD_CHANGE_REQUIRED' });
     next();
   } catch { return res.status(401).json({ error: 'Authentication required.' }); }
 };
@@ -236,16 +241,20 @@ function recordFailedLogin(req, username) {
 function clearLoginFailures(req, username) { loginAttempts.delete(rateKey(req, username)); }
 const dummyPasswordHash = bcrypt.hashSync('invalid-password-timing-protection', 10);
 
-app.get('/api/health', (req, res) => res.json({ ok: true, database: mongoReady() ? 'connected' : 'not configured' }));
+app.get('/api/health', (req, res) => {
+  const connected = mongoReady();
+  res.status(connected ? 200 : 503).json({ success: connected, database: connected ? 'connected' : process.env.MONGODB_URI ? 'disconnected' : 'not configured' });
+});
 app.post('/api/auth/login', async (req, res) => {
   const parsed = z.object({ username: usernameSchema, password: z.string().min(1).max(128) }).safeParse(req.body);
   const username = normalizeUsername(req.body?.username);
   if (!parsed.success) return res.status(400).json({ error: 'Enter a valid username and password.' });
   if (isRateLimited(req, username)) return res.status(429).json({ error: 'Too many login attempts. Try again in 15 minutes.' });
-  const user = await findUserByUsername(username);
+  let user = await findUserByUsername(username);
   const passwordOk = await bcrypt.compare(parsed.data.password, user?.passwordHash || dummyPasswordHash);
   if (!user || !passwordOk || !['admin', 'staff'].includes(user.role)) { recordFailedLogin(req, username); return res.status(401).json({ error: 'Invalid username or password.' }); }
-  if (user.accountStatus !== 'active') { recordFailedLogin(req, username); return res.status(403).json({ error: 'This account is inactive. Contact the CA owner.' }); }
+  if (user.accountStatus !== 'active') { recordFailedLogin(req, username); return res.status(403).json({ error: 'Your account was deactivated by the admin. Contact the CA owner to regain access.', code: 'ACCOUNT_INACTIVE' }); }
+  if (user.role === 'staff' && user.mustChangePassword) user = await updateUser(userId(user), { mustChangePassword: false }) || user;
   clearLoginFailures(req, username);
   const updated = await updateUser(userId(user), { lastLoginAt: new Date() });
   issueSession(res, updated || user);
@@ -268,6 +277,7 @@ app.post('/api/client-auth/login', async (req, res) => {
 app.post('/api/auth/logout', async (req, res) => { const token = readCookie(req, cookieName); try { const claims = jwt.verify(token, jwtSecret);const user = await findUserById(claims.sub);if (user) await updateUser(claims.sub, { sessionVersion: Number(user.sessionVersion || 0) + 1 });if (claims.jti) { revokedSessions.set(claims.jti, claims.exp || 0);for (const [id, expiry] of revokedSessions) if (expiry * 1000 < Date.now()) revokedSessions.delete(id); } } catch {} clearSessionCookie(res); res.status(204).end(); });
 app.get('/api/auth/me', auth({ allowPasswordChange: true }), (req, res) => res.json({ user: publicUser(req.user) }));
 app.post('/api/auth/change-password', auth({ allowPasswordChange: true }), async (req, res) => {
+  if (req.user.role === 'staff') return res.status(403).json({ error: 'Only the CA owner can change an employee password. Contact the admin to reset it.' });
   const parsed = z.object({ currentPassword: z.string().min(1).max(128), newPassword: passwordSchema }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Use a password of at least 12 characters with letters and numbers.' });
   if (!await bcrypt.compare(parsed.data.currentPassword, req.user.passwordHash)) return res.status(401).json({ error: 'Current password is incorrect.' });
@@ -282,25 +292,23 @@ app.get('/api/admin/users', auth(), allow('admin'), async (req, res) => {
   res.json(users.map(publicUser));
 });
 app.post('/api/admin/users', auth(), allow('admin'), async (req, res) => {
-  const parsed = z.object({ name: z.string().trim().min(2).max(100), username: usernameSchema, temporaryPassword: passwordSchema, role: z.enum(['admin', 'staff']), jobTitle: z.string().trim().max(80).optional() }).strict().safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: 'Enter a full name, username, temporary password (12+ characters), and role.' });
+  const parsed = z.object({ name: z.string().trim().min(2).max(100), username: usernameSchema, password: passwordSchema, role: z.literal('staff'), jobTitle: z.string().trim().max(80).optional() }).strict().safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Enter a full name, username, employee password (12+ characters), and job title.' });
   if (await findUserByUsername(parsed.data.username)) return res.status(409).json({ error: 'That username is already in use.' });
-  const created = await createUser({ name: parsed.data.name, username: parsed.data.username, passwordHash: await bcrypt.hash(parsed.data.temporaryPassword, 12), role: parsed.data.role, accountStatus: 'active', mustChangePassword: true, jobTitle: parsed.data.jobTitle || '' });
+  const created = await createUser({ name: parsed.data.name, username: parsed.data.username, passwordHash: await bcrypt.hash(parsed.data.password, 12), role: parsed.data.role, accountStatus: 'active', mustChangePassword: false, jobTitle: parsed.data.jobTitle || '' });
   if (!created) return res.status(409).json({ error: 'That username is already in use.' });
   if (mongoReady() && created.role === 'staff') await EmployeeProfile.create({ userId: created._id, title: created.jobTitle, active: true });
   res.status(201).json({ user: publicUser(created) });
 });
 app.patch('/api/admin/users/:id', auth(), allow('admin'), async (req, res) => {
-  const parsed = z.object({ name: z.string().trim().min(2).max(100).optional(), username: usernameSchema.optional(), role: z.enum(['admin', 'staff']).optional(), accountStatus: z.enum(['active', 'inactive']).optional(), jobTitle: z.string().trim().max(80).optional() }).strict().safeParse(req.body);
+  const parsed = z.object({ name: z.string().trim().min(2).max(100).optional(), username: usernameSchema.optional(), accountStatus: z.enum(['active', 'inactive']).optional(), jobTitle: z.string().trim().max(80).optional() }).strict().safeParse(req.body);
   if (!parsed.success || !Object.keys(parsed.data || {}).length) return res.status(400).json({ error: 'No valid account changes supplied.' });
   const target = await findUserById(req.params.id);
   if (!target || target.role !== 'staff') return res.status(404).json({ error: 'Only employee accounts can be edited here.' });
   if (parsed.data.username) { const other = await findUserByUsername(parsed.data.username); if (other && userId(other) !== userId(target)) return res.status(409).json({ error: 'That username is already in use.' }); }
-  const removesAdmin = target.role === 'admin' && ((parsed.data.role && parsed.data.role !== 'admin') || parsed.data.accountStatus === 'inactive');
-  if (removesAdmin && (await listUsers({ role: 'admin', accountStatus: 'active' })).filter(user => userId(user) !== userId(target)).length === 0) return res.status(409).json({ error: 'The firm must retain at least one active admin account.' });
   const userChanges = { ...parsed.data };if (parsed.data.accountStatus) userChanges.sessionVersion = Number(target.sessionVersion || 0) + 1;
   const updated = await updateUser(req.params.id, userChanges);
-  if (mongoReady() && updated.role === 'staff' && (parsed.data.role === 'staff' || parsed.data.jobTitle)) await EmployeeProfile.updateOne({ userId: updated._id }, { $set: { title: updated.jobTitle, active: updated.accountStatus === 'active' } }, { upsert: true });
+  if (mongoReady() && updated.role === 'staff' && (parsed.data.accountStatus || parsed.data.jobTitle)) await EmployeeProfile.updateOne({ userId: updated._id }, { $set: { title: updated.jobTitle, active: updated.accountStatus === 'active' } }, { upsert: true });
   res.json({ user: publicUser(updated) });
 });
 app.post('/api/admin/users/:id/reset-password', auth(), allow('admin'), async (req, res) => {
@@ -310,9 +318,75 @@ app.post('/api/admin/users/:id/reset-password', auth(), allow('admin'), async (r
   const target = await findUserById(req.params.id);
   const selfAdminReset = target?.role === 'admin' && userId(target) === req.user.id;
   if (!target || (target.role !== 'staff' && !selfAdminReset)) return res.status(404).json({ error: 'Only employee accounts or your own admin account can be reset here.' });
-  const updated = await updateUser(req.params.id, { passwordHash: await bcrypt.hash(parsed.data.newPassword, 12), mustChangePassword: !selfAdminReset, sessionVersion: Number(target.sessionVersion || 0) + 1 });
+  const updated = await updateUser(req.params.id, { passwordHash: await bcrypt.hash(parsed.data.newPassword, 12), mustChangePassword: false, sessionVersion: Number(target.sessionVersion || 0) + 1 });
   if (selfAdminReset) issueSession(res, updated);
-  res.json({ ok: true, mustChangePassword: !selfAdminReset });
+  res.json({ ok: true, mustChangePassword: false });
+});
+app.delete('/api/admin/users/:id', auth(), allow('admin'), async (req, res) => {
+  const parsed = z.object({ username: usernameSchema }).strict().safeParse(req.body);
+  const target = await findUserById(req.params.id);
+  if (!target || target.role !== 'staff') return res.status(404).json({ error: 'Employee account not found.' });
+  if (!parsed.success || parsed.data.username !== target.username) return res.status(400).json({ error: 'Enter the employee username exactly to confirm permanent removal.' });
+
+  const employeeId = userId(target);
+  await updateUser(employeeId, { accountStatus: 'inactive', sessionVersion: Number(target.sessionVersion || 0) + 1 });
+
+  if (mongoReady()) {
+    const [taskIds, employeeProfile] = await Promise.all([
+      Task.find({ assignee: employeeId }).distinct('_id'),
+      EmployeeProfile.findOne({ userId: employeeId }).select('_id').lean()
+    ]);
+    const taskConversationIds = taskIds.length ? await Conversation.find({ task: { $in: taskIds } }).distinct('_id') : [];
+    const authoredMessages = await Message.find({ sender: employeeId }).select('attachment').lean();
+    const authoredAttachmentIds = authoredMessages.map(message => message.attachment).filter(Boolean);
+    const messageScope = taskConversationIds.length ? { $or: [{ sender: employeeId }, { conversation: { $in: taskConversationIds } }] } : { sender: employeeId };
+    const relatedMessages = await Message.find(messageScope).select('_id attachment').lean();
+    const attachmentIds = [...new Set([...authoredAttachmentIds, ...relatedMessages.map(message => message.attachment).filter(Boolean).map(String)])];
+    const conversationIds = taskConversationIds;
+
+    await Notification.deleteMany(taskIds.length ? { $or: [{ recipient: employeeId }, { task: { $in: taskIds } }] } : { recipient: employeeId });
+    await PushSubscription.deleteMany({ owner: employeeId });
+    await Message.deleteMany(messageScope);
+    await Message.updateMany({ readBy: employeeId }, { $pull: { readBy: employeeId } });
+    const attachmentFilter = [{ owner: employeeId }, ...(taskIds.length ? [{ task: { $in: taskIds } }] : []), ...(taskConversationIds.length ? [{ conversation: { $in: taskConversationIds } }] : []), ...(attachmentIds.length ? [{ _id: { $in: attachmentIds } }] : [])];
+    await Attachment.deleteMany({ $or: attachmentFilter });
+    if (conversationIds.length) await Conversation.deleteMany({ _id: { $in: conversationIds } });
+    await Conversation.updateMany({ participants: employeeId }, { $pull: { participants: employeeId } });
+    const orphanInternalConversationIds = await Conversation.find({ internal: true, participants: { $size: 0 } }).distinct('_id');
+    if (orphanInternalConversationIds.length) {
+      const orphanMessages = await Message.find({ conversation: { $in: orphanInternalConversationIds } }).select('attachment').lean();
+      const orphanAttachmentIds = orphanMessages.map(message => message.attachment).filter(Boolean);
+      await Message.deleteMany({ conversation: { $in: orphanInternalConversationIds } });
+      await Attachment.deleteMany({ $or: [{ conversation: { $in: orphanInternalConversationIds } }, ...(orphanAttachmentIds.length ? [{ _id: { $in: orphanAttachmentIds } }] : [])] });
+      await Conversation.deleteMany({ _id: { $in: orphanInternalConversationIds } });
+    }
+    const activityClauses = [{ actor: employeeId }];
+    if (employeeProfile) activityClauses.push({ entityType: 'EmployeeProfile', entityId: employeeProfile._id });
+    if (taskIds.length) activityClauses.push({ entityType: 'Task', entityId: { $in: taskIds } });
+    await ActivityLog.deleteMany({ $or: activityClauses });
+    await Task.deleteMany({ assignee: employeeId });
+    await EmployeeProfile.deleteMany({ userId: employeeId });
+    await User.deleteOne({ _id: target._id, role: 'staff' });
+    return res.json({ ok: true, tasksDeleted: taskIds.length, messagesDeleted: relatedMessages.length });
+  }
+
+  const workspace = await readWorkspace();
+  const removedTasks = workspace.tasks.filter(task => String(task.assigneeId) === employeeId);
+  const taskIds = new Set(removedTasks.map(task => String(task._id)));
+  const removedConversations = workspace.conversations.filter(conversation => taskIds.has(String(conversation.task)) || (conversation.internal && (conversation.participants || []).every(id => String(id) === employeeId)));
+  const conversationIds = new Set(removedConversations.map(conversation => String(conversation._id)));
+  const removedMessages = workspace.messages.filter(message => String(message.sender) === employeeId || conversationIds.has(String(message.conversation)));
+  workspace.tasks = workspace.tasks.filter(task => !taskIds.has(String(task._id)));
+  workspace.notifications = workspace.notifications.filter(item => String(item.recipient) !== employeeId && !taskIds.has(String(item.task)));
+  workspace.pushSubscriptions = workspace.pushSubscriptions.filter(item => String(item.owner) !== employeeId);
+  workspace.messages = workspace.messages.filter(message => String(message.sender) !== employeeId && !conversationIds.has(String(message.conversation)));
+  workspace.messages.forEach(message => { message.readBy = (message.readBy || []).filter(id => String(id) !== employeeId); });
+  workspace.conversations = workspace.conversations.filter(conversation => !conversationIds.has(String(conversation._id)));
+  workspace.conversations.forEach(conversation => { conversation.participants = (conversation.participants || []).filter(id => String(id) !== employeeId); });
+  await writeWorkspace(workspace);
+  const authUsers = await readJson(authFile, []);
+  await persistUserList(authUsers.filter(user => userId(user) !== employeeId));
+  return res.json({ ok: true, tasksDeleted: removedTasks.length, messagesDeleted: removedMessages.length });
 });
 app.get('/api/team', auth(), allow('admin', 'staff'), async (req, res) => {
   const users = (await listUsers({ role: { $in: ['admin', 'staff'] } })).filter(user => ['admin', 'staff'].includes(user.role) && user.accountStatus === 'active');
@@ -500,15 +574,47 @@ async function migrateLegacyUsers() {
     while (await User.exists({ username })) { username = `${base.slice(0, 25)}${suffix++}`; }
     const role = row.role === 'employee' ? 'staff' : row.role;
     await User.collection.updateOne({ _id: row._id }, { $set: { username, role, accountStatus: row.accessStatus === 'active' ? 'active' : 'inactive', mustChangePassword: true, sessionVersion: Number(row.sessionVersion || 0), jobTitle: '' }, $unset: { email: '', accessStatus: '' } });
-  }  const indexes = await User.collection.indexes();
+  }
+  // Preserve accounts created by older versions that already have a username but use the old role name.
+  await User.collection.updateMany({ role: 'employee' }, { $set: { role: 'staff' } });
+  // Admin accounts are protected from employee status controls and always remain active.
+  await User.collection.updateMany({ role: 'admin', accountStatus: { $ne: 'active' } }, { $set: { accountStatus: 'active', mustChangePassword: false } });
+  const indexes = await User.collection.indexes();
   for (const index of indexes) if (index.key?.email && index.name !== '_id_') await User.collection.dropIndex(index.name);
 }
 let reminderJobBusy = false;
 async function runReminderJob() { if (reminderJobBusy) return;reminderJobBusy = true;try { await sendDueDateReminders(); } catch (error) { console.error('Due-date reminder job failed:', error.message); } finally { reminderJobBusy = false; } }
+const wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+async function connectMongoWithRetry() {
+  const uri = process.env.MONGODB_URI.trim();
+  const mongoDnsServers = (process.env.MONGODB_DNS_SERVERS || '').split(',').map(server => server.trim()).filter(Boolean);
+  if (mongoDnsServers.length) setServers(mongoDnsServers);
+  let attempt = 0;
+  while (!mongoReady()) {
+    attempt += 1;
+    try {
+      await mongoose.connect(uri, { serverSelectionTimeoutMS: 10000 });
+    } catch (error) {
+      const retrySeconds = Math.min(60, 5 * (2 ** Math.min(attempt - 1, 4)));
+      console.error(`MongoDB startup attempt ${attempt} failed:`, safeMongoError(error));
+      console.log(`Will retry the Atlas connection in ${retrySeconds} seconds. Check network access and IP allow-list if it keeps failing.`);
+      await wait(retrySeconds * 1000);
+    }
+  }
+}
 async function start() {
-  if (process.env.MONGODB_URI) {
-    try { await mongoose.connect(process.env.MONGODB_URI); await migrateLegacyUsers(); await User.init(); await bootstrapAdmin(); console.log('Connected to MongoDB.'); }
-    catch (error) { console.error('MongoDB startup failed:', error.message); if (process.env.NODE_ENV === 'production') process.exitCode = 1; }
+  if (process.env.MONGODB_URI?.trim()) {
+    try {
+      await connectMongoWithRetry();
+      await migrateLegacyUsers();
+      await User.init();
+      await bootstrapAdmin();
+      console.log('Connected to MongoDB Atlas.');
+    } catch (error) {
+      console.error('MongoDB startup failed:', safeMongoError(error));
+      process.exitCode = 1;
+      return;
+    }
   } else { await bootstrapAdmin(); console.warn('MongoDB is not configured; the private local JSON workspace store will back tasks, clients, conversations, and notifications. Configure MONGODB_URI for MongoDB persistence.'); }
   if (process.exitCode) return;
   app.listen(port, process.env.HOST || '0.0.0.0', () => { console.log(`CA Muktyar Ahmad & Co API listening on port ${port}`);runReminderJob();setInterval(runReminderJob, 60 * 1000); });
