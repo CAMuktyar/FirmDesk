@@ -20,13 +20,18 @@ self.addEventListener('fetch', event => {
 self.addEventListener('push', event => {
   let data = {};
   try { data = event.data ? event.data.json() : {}; } catch { data = { body: event.data?.text() || '' }; }
-  event.waitUntil(self.registration.showNotification(data.title || 'CA Muktyar Ahmad & Co', {
-    body: data.body || 'You have a new firm notification.',
-    icon: '/icons/ca-muktyar-ahmad-co.svg',
-    badge: '/icons/ca-muktyar-ahmad-co.svg',
-    tag: data.tag || 'ca-firm-alert',
-    data: { url: data.url || '/?open=notifications' },
-    renotify: true
+  event.waitUntil(self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clients => {
+    // A visible app tab announces the notification itself with an in-app toast,
+    // device notification, and sound. Avoid showing a duplicate push popup.
+    if (clients.some(client => client.visibilityState === 'visible')) return;
+    return self.registration.showNotification(data.title || 'CA Muktyar Ahmad & Co', {
+      body: data.body || 'You have a new firm notification.',
+      icon: '/icons/ca-muktyar-ahmad-co.svg',
+      badge: '/icons/ca-muktyar-ahmad-co.svg',
+      tag: data.tag || 'ca-firm-alert',
+      data: { url: data.url || '/?open=notifications' },
+      renotify: true
+    });
   }));
 });
 self.addEventListener('notificationclick', event => {

@@ -81,7 +81,7 @@ const Task = schema('Task', {
   priority: { type: String, enum: ['Normal', 'High', 'Urgent'], default: 'Normal' }, dueDate: { type: Date, required: true, index: true },
   status: { type: String, enum: ['Pending', 'In Progress', 'Waiting for Client', 'Under Review', 'Completed', 'Overdue'], default: 'Pending', index: true },
   progress: { type: Number, min: 0, max: 100, default: 0 }, internalNotes: String, clientComments: String,
-  activity: [{ actor: mongoose.Schema.Types.ObjectId, action: String, at: { type: Date, default: Date.now } }]
+  activity: [{ actor: mongoose.Schema.Types.ObjectId, action: String, metadata: mongoose.Schema.Types.Mixed, at: { type: Date, default: Date.now } }]
 });
 const Conversation = schema('Conversation', {
   participants: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true }],
@@ -94,7 +94,7 @@ const Message = schema('Message', {
   attachment: { type: mongoose.Schema.Types.ObjectId, ref: 'Attachment', default: null }, readBy: [mongoose.Schema.Types.ObjectId]
 });
 const Notification = schema('Notification', {
-  recipient: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true }, task: { type: mongoose.Schema.Types.ObjectId, ref: 'Task' },
+  recipient: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true }, sender: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null, index: true }, task: { type: mongoose.Schema.Types.ObjectId, ref: 'Task' },
   kind: String, title: { type: String, maxlength: 120 }, message: { type: String, required: true, maxlength: 300 }, readAt: Date, dedupeKey: { type: String, index: true }
 });
 const PushSubscription = schema('PushSubscription', { owner: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, endpoint: { type: String, required: true, unique: true }, expirationTime: Number, keys: { p256dh: String, auth: String } });
@@ -159,13 +159,13 @@ async function sendDeviceAlert(userId, payload) {
     catch (error) { if ([404, 410].includes(error.statusCode)) { if (mongoReady()) await PushSubscription.deleteOne({ _id: subscription._id }); else { const d = await readWorkspace();d.pushSubscriptions = d.pushSubscriptions.filter(x => x.endpoint !== subscription.endpoint);await writeWorkspace(d); } } }
   }));
 }
-async function createUserNotification(recipient, { title, message, kind = 'Firm alert', task = null, dedupeKey = null }) {
+async function createUserNotification(recipient, { title, message, kind = 'Firm alert', task = null, dedupeKey = null, sender = null }) {
   if (mongoReady()) {
     if (dedupeKey && await Notification.findOne({ dedupeKey })) return false;
-    await Notification.create({ recipient, task, title, message, kind, dedupeKey });
+    await Notification.create({ recipient, sender, task, title, message, kind, dedupeKey });
   } else {
     const data = await readWorkspace();if (dedupeKey && data.notifications.some(x => x.dedupeKey === dedupeKey)) return false;
-    data.notifications.push({ _id: crypto.randomUUID(), recipient: String(recipient), task: task ? String(task) : null, title, message, kind, dedupeKey, createdAt: new Date().toISOString(), readAt: null });await writeWorkspace(data);
+    data.notifications.push({ _id: crypto.randomUUID(), recipient: String(recipient), sender: sender ? String(sender) : null, task: task ? String(task) : null, title, message, kind, dedupeKey, createdAt: new Date().toISOString(), readAt: null });await writeWorkspace(data);
   }
   sendDeviceAlert(recipient, { title, body: kind === 'Admin alert' ? message : 'Open CA Muktyar Ahmad & Co to view this update.', url: '/?open=notifications' }).catch(error => console.error('Push delivery failed:', error.message));return true;
 }
@@ -454,6 +454,71 @@ app.get('/api/tasks', auth(), async (req, res) => {
   const rows = data.tasks.filter(t => req.user.role === 'admin' || req.user.role === 'staff' && t.assigneeId === req.user.id || req.user.role === 'client' && t.clientId === req.user.clientId);
   res.json(rows.map(t => ({ ...t, client: { name: t.clientName }, assignee: { name: users.find(u => userId(u) === t.assigneeId)?.name || '' } })).sort((a,b) => new Date(a.dueDate)-new Date(b.dueDate)));
 });
+app.get('/api/activity', auth(), async (req, res) => {
+  const filter = req.user.role === 'admin' ? {} : req.user.role === 'staff' ? { assignee: req.user.id } : { client: req.user.clientId };
+  let records, actorNames;
+  if (mongoReady()) {
+    const tasks = await Task.find(filter).populate('client', 'name').populate('assignee', 'name').sort({ updatedAt: -1 }).limit(100).lean();
+    const actorIds = [...new Set(tasks.flatMap(task => (task.activity || []).map(event => String(event.actor || '')).filter(Boolean)))];
+    const actors = actorIds.length ? await User.find({ _id: { $in: actorIds } }).select('name').lean() : [];
+    actorNames = new Map(actors.map(actor => [String(actor._id), actor.name]));
+    records = tasks.flatMap(task => {
+      const events = task.activity?.length ? task.activity : [{ actor: task.assignee?._id, action: 'Task updated', metadata: { status: task.status, progress: task.progress }, at: task.updatedAt || task.createdAt }];
+      return events.map(event => ({
+        _id: String(task._id) + ':' + String(event._id || event.at || task.updatedAt),
+        actorName: actorNames.get(String(event.actor)) || task.assignee?.name || 'Team member', action: event.action || 'Task updated',
+        metadata: event.metadata || {}, taskTitle: task.title, clientName: task.client?.name || '',
+        service: task.service, assigneeName: task.assignee?.name || '', createdAt: event.at || task.updatedAt || task.createdAt
+      }));
+    });
+  } else {
+    const data = await readWorkspace();
+    const tasks = data.tasks.filter(task => req.user.role === 'admin' || req.user.role === 'staff' && task.assigneeId === req.user.id || req.user.role === 'client' && task.clientId === req.user.clientId);
+    const users = await listUsers({});
+    const names = new Map(users.map(user => [userId(user), user.name]));
+    records = tasks.flatMap(task => {
+      const events = task.activity?.length ? task.activity : [{ actor: task.assigneeId, action: 'Task updated', metadata: { status: task.status, progress: task.progress }, at: task.updatedAt || task.createdAt }];
+      return events.map((event, index) => ({
+        _id: String(task._id) + ':' + String(event.at || index), actorName: names.get(String(event.actor)) || 'Team member',
+        action: event.action || 'Task updated', metadata: event.metadata || {}, taskTitle: task.title,
+        clientName: task.clientName || '', service: task.service, assigneeName: names.get(String(task.assigneeId)) || '',
+        createdAt: event.at || task.updatedAt || task.createdAt
+      }));
+    });
+  }
+  if (mongoReady()) {
+    const notificationFilter = req.user.role === 'admin' ? { kind: { $in: ['Admin alert', 'Employee work update'] } } : req.user.role === 'staff' ? { $or: [{ recipient: req.user.id, kind: 'Admin alert' }, { sender: req.user.id, kind: 'Employee work update' }] } : null;
+    if (notificationFilter) {
+      const alerts = await Notification.find(notificationFilter).populate('sender', 'name').populate('recipient', 'name').sort({ createdAt: -1 }).limit(100).lean();
+      records.push(...alerts.map(item => {
+        const senderName = item.sender?.name || (item.kind === 'Employee work update' ? 'Employee' : 'Admin');
+        const sentWorkUpdate = item.kind === 'Employee work update';
+        const summary = sentWorkUpdate ? (req.user.role === 'admin' ? `${senderName} sent a work update: ${item.title}` : 'You sent a work update: ' + item.title) : (req.user.role === 'admin' ? `${senderName} sent an alert to ${item.recipient?.name || 'an employee'}: ${item.title}` : `${senderName} sent you an alert: ${item.title}`);
+        return { _id: 'notification:' + String(item._id), kind: item.kind, actorName: senderName, action: item.kind, taskTitle: item.title || 'Employee alert', clientName: sentWorkUpdate ? 'Employee notification' : req.user.role === 'admin' ? 'To ' + (item.recipient?.name || 'employee') : 'Sent to you', service: sentWorkUpdate ? 'Employee update' : 'Notification', createdAt: item.createdAt, summary };
+      }));
+    }
+  } else if (req.user.role === 'admin' || req.user.role === 'staff') {
+    const data = await readWorkspace();
+    const alerts = data.notifications.filter(item => req.user.role === 'admin' ? ['Admin alert', 'Employee work update'].includes(item.kind) : item.kind === 'Admin alert' && String(item.recipient) === req.user.id || item.kind === 'Employee work update' && String(item.sender) === req.user.id);
+    const users = await listUsers({});
+    const names = new Map(users.map(user => [userId(user), user.name]));
+    records.push(...alerts.map(item => {
+      const senderName = names.get(String(item.sender)) || (item.kind === 'Employee work update' ? 'Employee' : 'Admin');
+      const sentWorkUpdate = item.kind === 'Employee work update';
+      const summary = sentWorkUpdate ? (req.user.role === 'admin' ? `${senderName} sent a work update: ${item.title}` : 'You sent a work update: ' + item.title) : (req.user.role === 'admin' ? `${senderName} sent an alert to ${names.get(String(item.recipient)) || 'an employee'}: ${item.title}` : `${senderName} sent you an alert: ${item.title}`);
+      return { _id: 'notification:' + String(item._id), kind: item.kind, action: item.kind, actorName: senderName, taskTitle: item.title || 'Employee alert', clientName: sentWorkUpdate ? 'Employee notification' : req.user.role === 'admin' ? 'To ' + (names.get(String(item.recipient)) || 'employee') : 'Sent to you', service: sentWorkUpdate ? 'Employee update' : 'Notification', createdAt: item.createdAt, summary };
+    }));
+  }
+  records.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  res.json(records.slice(0, 100).map(item => {
+    if (item.kind === 'Admin alert' || item.kind === 'Employee work update') return item;
+    const changes = [];
+    if (item.metadata.status) changes.push(item.metadata.status);
+    if (item.metadata.progress !== undefined) changes.push(item.metadata.progress + '%');
+    const eventText = item.action === 'Task created' ? 'created task' : changes.length ? 'updated task · ' + changes.join(' · ') : 'updated task';
+    return { ...item, summary: item.actorName + ' ' + eventText + ': ' + item.taskTitle };
+  }));
+});
 app.post('/api/tasks', auth(), allow('admin'), async (req, res) => {
   const parsed = taskInput.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Invalid task.', details: parsed.error.flatten() });
@@ -462,8 +527,8 @@ app.post('/api/tasks', auth(), allow('admin'), async (req, res) => {
     if (!client) { try { client = await ClientProfile.create({ name: parsed.data.client }); } catch { return res.status(400).json({ error: 'Select a valid client.' }); } }
     const assignee = mongoose.isValidObjectId(parsed.data.assignee) ? await User.findOne({ _id: parsed.data.assignee, role: 'staff', accountStatus: 'active' }) : await User.findOne({ name: parsed.data.assignee, role: 'staff', accountStatus: 'active' });
     if (!assignee) return res.status(400).json({ error: 'Select an active staff account from the employee directory.' });
-    const task = await Task.create({ ...parsed.data, client: client._id, assignee: assignee._id, activity: [{ actor: req.user.id, action: 'Task created' }] });
-    await ActivityLog.create({ actor: req.user.id, entityType: 'Task', entityId: task.id, action: 'created' });
+    const task = await Task.create({ ...parsed.data, client: client._id, assignee: assignee._id, activity: [{ actor: req.user.id, action: 'Task created', metadata: { status: parsed.data.status || 'Pending', progress: parsed.data.progress || 0 } }] });
+    await ActivityLog.create({ actor: req.user.id, entityType: 'Task', entityId: task.id, action: 'created', metadata: { title: task.title, status: task.status, progress: task.progress, service: task.service } });
     await createUserNotification(assignee._id, { task: task._id, kind: 'Task assigned', title: 'New task assigned', message: task.title+' was assigned to you.' });
     await Conversation.updateOne({ client: client._id, internal: false }, { $addToSet: { participants: assignee._id } });
     return res.status(201).json(await task.populate([{ path: 'client', select: 'name' }, { path: 'assignee', select: 'name username' }]));
@@ -471,7 +536,7 @@ app.post('/api/tasks', auth(), allow('admin'), async (req, res) => {
   const data = await readWorkspace();const users = await listUsers({});const assignee = users.find(u => u.name === parsed.data.assignee && u.role === 'staff' && u.accountStatus === 'active');
   if (!assignee) return res.status(400).json({ error: 'Select an active staff account from the employee directory.' });
   const clientName = parsed.data.client.trim();let client = data.clients.find(c => c.name.toLowerCase() === clientName.toLowerCase());if (!client) { client = { _id: crypto.randomUUID(), name: clientName };data.clients.push(client); }
-  const task = { _id: crypto.randomUUID(), clientId: String(client._id), title: parsed.data.title, description: parsed.data.description || '', clientName, assigneeId: userId(assignee), service: parsed.data.service, priority: parsed.data.priority, dueDate: parsed.data.dueDate, status: parsed.data.status || 'Pending', progress: parsed.data.progress || 0, clientComments: '', activity: [{ actor: req.user.id, action: 'Task created', at: new Date().toISOString() }], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+  const task = { _id: crypto.randomUUID(), clientId: String(client._id), title: parsed.data.title, description: parsed.data.description || '', clientName, assigneeId: userId(assignee), service: parsed.data.service, priority: parsed.data.priority, dueDate: parsed.data.dueDate, status: parsed.data.status || 'Pending', progress: parsed.data.progress || 0, clientComments: '', activity: [{ actor: req.user.id, action: 'Task created', metadata: { status: parsed.data.status || 'Pending', progress: parsed.data.progress || 0 }, at: new Date().toISOString() }], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
   data.tasks.push(task);const clientConversation = data.conversations.find(c => c.clientId === String(client._id) && !c.internal);if (clientConversation && !clientConversation.participants.includes(task.assigneeId)) clientConversation.participants.push(task.assigneeId);await writeWorkspace(data);await createUserNotification(task.assigneeId, { task: task._id, kind: 'Task assigned', title: 'New task assigned', message: task.title+' was assigned to you.' });
   res.status(201).json({ ...task, client: { name: clientName }, assignee: { name: assignee.name, username: assignee.username } });
 });
@@ -485,11 +550,11 @@ app.patch('/api/tasks/:id', auth(), async (req, res) => {
   const allowedFields = req.user.role === 'client' ? ['clientComments'] : req.user.role === 'admin' ? ['status', 'progress', 'assignee'] : ['status', 'progress'];
   const updates = z.object({ status: z.enum(['Pending', 'In Progress', 'Waiting for Client', 'Under Review', 'Completed', 'Overdue']).optional(), progress: z.number().min(0).max(100).optional(), clientComments: z.string().max(3000).optional(), assignee: z.string().optional() }).strict().safeParse(req.body);
   if (!updates.success || Object.keys(updates.data || {}).some(key => !allowedFields.includes(key))) return res.status(400).json({ error: 'This role cannot change those task fields.' });
-  if (req.user.role === 'staff' && updates.data.status === 'Completed') updates.data.status = 'Under Review';
+  if (updates.data.status === 'Completed' && updates.data.progress === undefined) updates.data.progress = 100;
   const changes = { ...updates.data };delete changes.assignee;let reassignedUser=null;const oldAssigneeId=mongoReady()?String(task.assignee):task.assigneeId;
   if (updates.data.assignee) { const assignee = mongoReady() ? await User.findOne({ name: updates.data.assignee, role: 'staff', accountStatus: 'active' }) : (await listUsers({})).find(u => u.name === updates.data.assignee && u.role === 'staff' && u.accountStatus === 'active');if (!assignee) return res.status(400).json({ error: 'Select an active staff account.' });reassignedUser=assignee;if (mongoReady()) task.assignee = assignee._id;else task.assigneeId = userId(assignee); }
-  Object.assign(task, changes);task.activity ||= [];task.activity.push({ actor: req.user.id, action: req.user.role === 'client' ? 'Client update' : 'Task updated', at: new Date().toISOString() });
-  if (mongoReady()) { await task.save();await ActivityLog.create({ actor: req.user.id, entityType: 'Task', entityId: task.id, action: 'updated', metadata: updates.data });if (reassignedUser && userId(reassignedUser)!==oldAssigneeId) { await createUserNotification(userId(reassignedUser), { task: task._id, kind: 'Task assigned', title: 'Task assigned to you', message: task.title+' was assigned to you.' });await Conversation.updateOne({ client: task.client, internal: false }, { $addToSet: { participants: reassignedUser._id } }); }return res.json(await task.populate([{ path: 'client', select: 'name' }, { path: 'assignee', select: 'name username' }])); }
+  Object.assign(task, changes);task.activity ||= [];task.activity.push({ actor: req.user.id, action: req.user.role === 'client' ? 'Client update' : 'Task updated', metadata: { ...updates.data, status: task.status, progress: task.progress }, at: new Date().toISOString() });
+  if (mongoReady()) { await task.save();await ActivityLog.create({ actor: req.user.id, entityType: 'Task', entityId: task.id, action: 'updated', metadata: { ...updates.data, title: task.title, status: task.status, progress: task.progress, service: task.service } });if (reassignedUser && userId(reassignedUser)!==oldAssigneeId) { await createUserNotification(userId(reassignedUser), { task: task._id, kind: 'Task assigned', title: 'Task assigned to you', message: task.title+' was assigned to you.' });await Conversation.updateOne({ client: task.client, internal: false }, { $addToSet: { participants: reassignedUser._id } }); }return res.json(await task.populate([{ path: 'client', select: 'name' }, { path: 'assignee', select: 'name username' }])); }
   task.updatedAt = new Date().toISOString();await writeWorkspace(localData);if (reassignedUser && userId(reassignedUser)!==oldAssigneeId) { const c=localData.conversations.find(x=>x.clientId===task.clientId&&!x.internal);if(c&&!c.participants.includes(task.assigneeId))c.participants.push(task.assigneeId);await writeWorkspace(localData);await createUserNotification(task.assigneeId,{task:task._id,kind:'Task assigned',title:'Task assigned to you',message:task.title+' was assigned to you.'}); }const assignee = await findUserById(task.assigneeId);res.json({ ...task, client: { name: task.clientName }, assignee: { name: assignee?.name || '' } });
 });
 app.delete('/api/tasks/:id', auth(), allow('admin'), async (req, res) => {
@@ -515,27 +580,53 @@ app.post('/api/admin/notifications', auth(), allow('admin'), async (req, res) =>
   if (!parsed.success) return res.status(400).json({ error: 'Enter a title and message.' });
   const staffUsers = await listUsers({ role: 'staff', accountStatus: 'active' });const recipients = parsed.data.recipientId === 'all' ? staffUsers : staffUsers.filter(x => userId(x) === parsed.data.recipientId);
   if (!recipients.length) return res.status(404).json({ error: 'No active staff account found.' });
-  for (const user of recipients) await createUserNotification(userId(user), { title: parsed.data.title, message: parsed.data.message, kind: 'Admin alert' });
+  for (const user of recipients) await createUserNotification(userId(user), { title: parsed.data.title, message: parsed.data.message, kind: 'Admin alert', sender: req.user.id });
   res.status(201).json({ sent: recipients.length });
 });
+app.get('/api/admin/notifications/sent', auth(), allow('admin'), async (req, res) => {
+  if (mongoReady()) {
+    const items = await Notification.find({ kind: 'Admin alert' }).populate('recipient', 'name username').populate('sender', 'name username').sort({ createdAt: -1 }).limit(200).lean();
+    return res.json(items.map(item => ({ _id: String(item._id), title: item.title, message: item.message, createdAt: item.createdAt, readAt: item.readAt || null, recipientName: item.recipient?.name || 'Former employee', recipientUsername: item.recipient?.username || '', senderName: item.sender?.name || 'Admin' })));
+  }
+  const data = await readWorkspace();const users = await listUsers({});const items = data.notifications.filter(item => item.kind === 'Admin alert').sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 200);
+  res.json(items.map(item => { const recipient = users.find(user => userId(user) === String(item.recipient));const sender = users.find(user => userId(user) === String(item.sender));return { ...item, recipientName: recipient?.name || 'Former employee', recipientUsername: recipient?.username || '', senderName: sender?.name || 'Admin' }; }));
+});
 app.post('/api/staff/work-updates', auth(), allow('staff'), async (req, res) => {
-  const parsed = z.object({ taskId: z.string().min(1).max(64), details: z.string().trim().min(5).max(190) }).strict().safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: 'Select an assigned task and enter at least 5 characters of work details.' });
-  let task;
-  if (mongoReady()) task = await Task.findOne({ _id: parsed.data.taskId, assignee: req.user.id }).select('title').lean();
-  else task = (await readWorkspace()).tasks.find(x => x._id === parsed.data.taskId && x.assigneeId === req.user.id);
-  if (!task) return res.status(404).json({ error: 'That task is not assigned to your account.' });
+  const parsed = z.object({ taskId: z.string().min(1).max(64).optional(), details: z.string().trim().min(5).max(190) }).strict().safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Enter at least 5 characters of notification details.' });
+  let task = null;
+  if (parsed.data.taskId) {
+    if (mongoReady()) task = await Task.findOne({ _id: parsed.data.taskId, assignee: req.user.id }).select('title').lean();
+    else task = (await readWorkspace()).tasks.find(x => x._id === parsed.data.taskId && x.assigneeId === req.user.id);
+    if (!task) return res.status(404).json({ error: 'That task is not assigned to your account.' });
+  }
   const admins = await listUsers({ role: 'admin', accountStatus: 'active' });
   if (!admins.length) return res.status(503).json({ error: 'No active admin account is available to receive this update.' });
-  const title = 'Work update: ' + String(task.title || 'Assigned task').slice(0, 95);
+  const title = task ? 'Work update: ' + String(task.title || 'Assigned task').slice(0, 95) : 'Employee notification';
   const message = req.user.name + ': ' + parsed.data.details;
-  for (const admin of admins) await createUserNotification(userId(admin), { task: task._id, title, message, kind: 'Employee work update' });
+  for (const admin of admins) await createUserNotification(userId(admin), { task: task?._id || null, title, message, kind: 'Employee work update', sender: req.user.id });
   res.status(201).json({ sent: admins.length });
 });
 app.get('/api/notifications', auth(), async (req, res) => res.json(mongoReady() ? await Notification.find({ recipient: req.user.id }).sort({ createdAt: -1 }).limit(100) : (await readWorkspace()).notifications.filter(x => x.recipient === req.user.id).sort((a,b) => new Date(b.createdAt)-new Date(a.createdAt))));
+app.get('/api/notifications/sent', auth(), allow('staff'), async (req, res) => {
+  if (mongoReady()) {
+    const items = await Notification.find({ sender: req.user.id, kind: 'Employee work update' }).select('title message createdAt kind').sort({ createdAt: -1 }).limit(100).lean();
+    return res.json(items.map(item => ({ _id: String(item._id), title: item.title, message: item.message, createdAt: item.createdAt, kind: item.kind })));
+  }
+  const data = await readWorkspace();
+  res.json(data.notifications.filter(item => item.sender === req.user.id && item.kind === 'Employee work update').sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 100));
+});
 app.patch('/api/notifications/:id/read', auth(), async (req, res) => {
   if (mongoReady()) { const item = await Notification.findOneAndUpdate({ _id: req.params.id, recipient: req.user.id }, { readAt: new Date() }, { new: true });return item ? res.json(item) : res.status(404).json({ error: 'Notification not found.' }); }
   const data = await readWorkspace();const item = data.notifications.find(x => x._id === req.params.id && x.recipient === req.user.id);if (!item) return res.status(404).json({ error: 'Notification not found.' });item.readAt = new Date().toISOString();await writeWorkspace(data);res.json(item);
+});
+app.delete('/api/notifications/:id', auth(), async (req, res) => {
+  if (mongoReady()) { const item = await Notification.findOneAndDelete({ _id: req.params.id, recipient: req.user.id });return item ? res.json({ ok: true }) : res.status(404).json({ error: 'Notification not found.' }); }
+  const data = await readWorkspace();const index = data.notifications.findIndex(item => item._id === req.params.id && item.recipient === req.user.id);if (index < 0) return res.status(404).json({ error: 'Notification not found.' });data.notifications.splice(index, 1);await writeWorkspace(data);res.json({ ok: true });
+});
+app.delete('/api/admin/notifications/sent/:id', auth(), allow('admin'), async (req, res) => {
+  if (mongoReady()) { const item = await Notification.findOneAndDelete({ _id: req.params.id, kind: 'Admin alert' });return item ? res.json({ ok: true }) : res.status(404).json({ error: 'Sent employee alert not found.' }); }
+  const data = await readWorkspace();const index = data.notifications.findIndex(item => item._id === req.params.id && item.kind === 'Admin alert');if (index < 0) return res.status(404).json({ error: 'Sent employee alert not found.' });data.notifications.splice(index, 1);await writeWorkspace(data);res.json({ ok: true });
 });
 app.get('/api/conversations', auth(), async (req, res) => {
   if (mongoReady()) { const filter = req.user.role === 'admin' ? {} : req.user.role === 'client' ? { participants: req.user.id, client: req.user.clientId, internal: false } : { participants: req.user.id };return res.json(await Conversation.find(filter).populate('client', 'name').sort({ updatedAt: -1 })); }

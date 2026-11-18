@@ -20,6 +20,10 @@ async function apiIsHealthy() {
   }
 }
 
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 function watch(child, name) {
   children.push(child);
   child.on('error', error => {
@@ -34,12 +38,28 @@ function watch(child, name) {
   });
 }
 
+process.once('SIGINT', () => stop(0));
+process.once('SIGTERM', () => stop(0));
+
 if (await apiIsHealthy()) {
   console.log('Reusing the CAFlow API already running on port 4000.');
 } else {
   watch(spawn(process.execPath, ['server/index.js'], { stdio: 'inherit', env: process.env }), 'CAFlow API');
+  console.log('Waiting for the API and MongoDB connection before starting Vite…');
+  const deadline = Date.now() + 90_000;
+  let ready = false;
+  while (!shuttingDown && Date.now() < deadline) {
+    if (await apiIsHealthy()) {
+      ready = true;
+      break;
+    }
+    await delay(500);
+  }
+  if (!ready) {
+    if (!shuttingDown) {
+      console.error('The API did not become healthy within 90 seconds. Check the MongoDB connection and API startup output.');
+      stop(1);
+    }
+  }
 }
-watch(spawn(process.execPath, ['node_modules/vite/bin/vite.js', '--host', '0.0.0.0'], { stdio: 'inherit', env: process.env }), 'Vite frontend');
-
-process.once('SIGINT', () => stop(0));
-process.once('SIGTERM', () => stop(0));
+if (!shuttingDown) watch(spawn(process.execPath, ['node_modules/vite/bin/vite.js', '--host', '0.0.0.0'], { stdio: 'inherit', env: process.env }), 'Vite frontend');
