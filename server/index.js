@@ -13,8 +13,11 @@ import { z } from 'zod';
 
 const app = express();
 const port = Number(process.env.PORT || 4000);
+const isVercel = Boolean(process.env.VERCEL);
 const sessionHours = Math.max(1, Number(process.env.SESSION_HOURS || 8));
 const sessionSeconds = sessionHours * 60 * 60;
+const requestedCookieSameSite = String(process.env.SESSION_COOKIE_SAME_SITE || 'strict').toLowerCase();
+const sessionCookieSameSite = ['strict', 'lax', 'none'].includes(requestedCookieSameSite) ? requestedCookieSameSite : 'strict';
 const cookieName = 'ca_session';
 const authFile = process.env.AUTH_STORE_FILE || path.join(process.cwd(), '.ca-auth-users.json');
 const workspaceFile = process.env.WORKSPACE_STORE_FILE || path.join(process.cwd(), '.ca-workspace.json');
@@ -115,7 +118,13 @@ async function atomicWrite(file, value) {
 const mongoReady = () => mongoose.connection.readyState === 1;
 const safeMongoError = error => String(error?.message || error).replace(/(mongodb(?:\+srv)?:\/\/)[^\s@]+@/gi, '$1[REDACTED]@');
 mongoose.connection.on('error', error => console.error('MongoDB connection error:', safeMongoError(error)));
-mongoose.connection.on('disconnected', () => console.error('MongoDB disconnected.'));
+mongoose.connection.on('disconnected', () => {
+  console.error('MongoDB disconnected.');
+  if (isVercel) {
+    vercelMongoInitialization = undefined;
+    vercelMongoInitialized = false;
+  }
+});
 const db = (req, res, next) => mongoReady() ? next() : res.status(503).json({ error: 'Database unavailable. Configure MONGODB_URI to use database-backed tasks and conversations.' });
 const normalizeUsername = value => String(value || '').trim().toLowerCase();
 const usernameRegex = value => new RegExp(`^${normalizeUsername(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i');
@@ -194,7 +203,35 @@ async function bootstrapAdmin() {
   console.log(`Bootstrapped CA owner account: ${username}`);
 }
 
-const cookieOptions = () => ({ httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'strict', path: '/api', maxAge: sessionSeconds * 1000 });
+// Vercel Functions are short-lived and may run concurrently. Cache one MongoDB
+// connection/initialization promise per warm function instance; never fall back
+// to local JSON files in production because the function filesystem is ephemeral.
+let vercelMongoInitialization;
+let vercelMongoInitialized = false;
+async function initializeVercelMongo() {
+  if (!isVercel) return;
+  if (vercelMongoInitialized && mongoReady()) return;
+  if (vercelMongoInitialization) return vercelMongoInitialization;
+  vercelMongoInitialization = (async () => {
+    const uri = process.env.MONGODB_URI?.trim();
+    if (!uri) throw new Error('MONGODB_URI is not configured.');
+    const mongoDnsServers = (process.env.MONGODB_DNS_SERVERS || '').split(',').map(server => server.trim()).filter(Boolean);
+    if (mongoDnsServers.length) setServers(mongoDnsServers);
+    if (!mongoReady()) await mongoose.connect(uri, { serverSelectionTimeoutMS: 8000, maxPoolSize: 5 });
+    await migrateLegacyUsers();
+    await User.init();
+    await bootstrapAdmin();
+  })();
+  try {
+    await vercelMongoInitialization;
+    vercelMongoInitialized = true;
+  } catch (error) {
+    vercelMongoInitialization = undefined;
+    throw error;
+  }
+}
+
+const cookieOptions = () => ({ httpOnly: true, secure: process.env.NODE_ENV === 'production' || sessionCookieSameSite === 'none', sameSite: sessionCookieSameSite, path: '/api', maxAge: sessionSeconds * 1000 });
 const clearSessionCookie = res => { const { maxAge, ...options } = cookieOptions();res.clearCookie(cookieName, options); };
 function readCookie(req, name) {
   const raw = req.headers.cookie || '';
@@ -240,6 +277,18 @@ function recordFailedLogin(req, username) {
 }
 function clearLoginFailures(req, username) { loginAttempts.delete(rateKey(req, username)); }
 const dummyPasswordHash = bcrypt.hashSync('invalid-password-timing-protection', 10);
+
+if (isVercel) {
+  app.use('/api', async (req, res, next) => {
+    try {
+      await initializeVercelMongo();
+      next();
+    } catch (error) {
+      console.error('Vercel MongoDB initialization failed:', safeMongoError(error));
+      res.status(503).json({ error: 'The database is unavailable. Check the Vercel MONGODB_URI and MongoDB Atlas Network Access settings.' });
+    }
+  });
+}
 
 app.get('/api/health', (req, res) => {
   const connected = mongoReady();
@@ -710,6 +759,6 @@ async function start() {
   if (process.exitCode) return;
   app.listen(port, process.env.HOST || '0.0.0.0', () => { console.log(`CA Muktyar Ahmad & Co API listening on port ${port}`);runReminderJob();setInterval(runReminderJob, 60 * 1000); });
 }
-start();
+if (!isVercel) start();
 
 export { app, User, mongoReady };

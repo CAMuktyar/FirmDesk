@@ -52,3 +52,25 @@ The API supports protected task, notification, employee-profile, and conversatio
 When a task is created or reassigned, the assigned employee receives an in-app notification and a web push on each device where they enabled alerts. The API checks every minute for tasks due in about 24 hours and sends one reminder per task. Admins can also send an alert to one active employee or all active employees from **Notifications**.
 
 On each employee device, sign in, open **Notifications**, choose **Enable device alerts**, and allow the browser prompt. The API server must be running for assignment pushes, scheduled reminders, and manual broadcasts. The .env contains VAPID public/private keys; the public key is sent to the browser during subscription, while the private key must remain server-only. Configure the same VAPID settings in the production API environment. Browser push requires HTTPS in deployment; localhost is supported for development. A LAN URL using plain HTTP may not support push subscriptions.
+
+
+## Deploy the frontend and API together on Vercel
+
+The Vite frontend is built as static files, and `api/[...path].js` sends every `/api/*` request to the existing Express application. The Express app connects to Atlas on its first API request in each warm Vercel Function instance. It does not start a local HTTP listener or use the ephemeral JSON file stores on Vercel.
+
+In the Vercel project, use the repository root as the Root Directory, Vite as the detected framework, `npm run build` as the Build Command, and `dist` as the Output Directory. Add these under **Project Settings → Environment Variables** for Production (and Preview too if you will test preview deployments):
+
+- `MONGODB_URI`: the Atlas connection string copied from Atlas, including the database user/password and database name.
+- `JWT_SECRET`: a unique random secret of at least 32 characters.
+- `ADMIN_NAME`, `ADMIN_USERNAME`, `ADMIN_PASSWORD`: credentials used only to create the first admin if the database has no admin account. Existing admin accounts are not overwritten.
+- `CLIENT_ORIGIN`: the exact production website origin, such as `https://your-project.vercel.app` (no trailing slash). Vercel deployment origins are also recognized automatically.
+- `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT`: optional, only for browser push notifications.
+- `SESSION_HOURS`: optional; defaults to 8.
+
+Do not set `VITE_API_URL` for this single-origin setup; leave it unset or blank so browser requests use `/api` on the same Vercel domain. Do not put secrets in variables prefixed with `VITE_`. `PORT` is only for local development and is not needed on Vercel. Keep `SESSION_COOKIE_SAME_SITE=strict` (the default) because the UI and API share the same origin.
+
+In MongoDB Atlas, make sure the database user/password in `MONGODB_URI` are correct and Network Access permits connections from the deployed Vercel Functions. A local laptop IP allow-list entry does not permit Vercel. Prefer Vercel static egress IP access if available for your plan. Atlas `0.0.0.0/0` allows connections from any IP and should only be used if necessary, with a strong database password and a database user limited to this application's database.
+
+After saving variables, redeploy the project. Check `https://your-project.vercel.app/api/health`; a successful response is JSON with `success: true` and `database: "connected"`. Then test employee/admin login from the same domain. If the health route returns HTML, the latest deployment is missing the `api/[...path].js` function or it was deployed from the wrong Root Directory. If it returns the JSON 503 message, check Vercel Function logs, `MONGODB_URI`, and Atlas Network Access.
+
+Vercel Functions do not keep the local server's `setInterval` alive between requests. Task assignment and manual push alerts happen during API requests, but the old every-minute due-date reminder loop needs a Vercel Cron endpoint to run reliably after deployment.
