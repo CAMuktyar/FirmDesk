@@ -21,7 +21,7 @@ const sessionCookieSameSite = ['strict', 'lax', 'none'].includes(requestedCookie
 const cookieName = 'ca_session';
 const authFile = process.env.AUTH_STORE_FILE || path.join(process.cwd(), '.ca-auth-users.json');
 const workspaceFile = process.env.WORKSPACE_STORE_FILE || path.join(process.cwd(), '.ca-workspace.json');
-const configuredOrigin = process.env.CLIENT_ORIGIN || 'http://localhost:5173';
+const configuredOrigin = process.env.CLIENT_ORIGIN || (process.env.NODE_ENV === 'production' ? '' : 'http://localhost:5173');
 const localOriginPattern = /^https?:\/\/(localhost|127\.0\.0\.1|192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})(:\d+)?$/;
 const allowedOrigins = new Set([
   configuredOrigin,
@@ -29,7 +29,7 @@ const allowedOrigins = new Set([
   process.env.VERCEL_URL && `https://${process.env.VERCEL_URL}`,
   process.env.VERCEL_PROJECT_PRODUCTION_URL && `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`
 ].filter(Boolean));
-const isAllowedOrigin = origin => allowedOrigins.has(origin) || localOriginPattern.test(origin);
+const isAllowedOrigin = origin => allowedOrigins.has(origin) || (process.env.NODE_ENV !== 'production' && localOriginPattern.test(origin));
 const vapidPublicKey = process.env.VAPID_PUBLIC_KEY || '';
 const vapidPrivateKey = process.env.VAPID_PRIVATE_KEY || '';
 if (vapidPublicKey && vapidPrivateKey) webpush.setVapidDetails(process.env.VAPID_SUBJECT || 'mailto:admin@example.com', vapidPublicKey, vapidPrivateKey);
