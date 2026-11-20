@@ -23,6 +23,8 @@ The command asks for a full name, unique username, and strong password. It store
 
 If the owner cannot sign in, run `npm run reset-admin` from the project folder. Enter the existing admin username and a new strong password. This resets that admin account's password, restores its active status, and does not reveal or store a plaintext password. The MongoDB-backed command requires Atlas to be reachable from the current network.
 
+To permanently clear all workspace records while preserving admin login accounts and IDs, update the project-root `.env` with the current `MONGODB_URI`, then run `npm run clear-workspace`. Review the printed database name and counts, then type the exact confirmation requested by the script. It deletes all non-admin users and all documents in the app's other collections. Do not run it unless you intend to erase that database's workspace data.
+
 The admin signs in, then manages employee accounts in **Employees**: create accounts with a unique username and password, edit name/username/job title, assign Admin or Staff role, reset passwords, and activate/deactivate accounts. Employee credentials remain active until an admin resets them; employees cannot change their own passwords. Employee access is username-only; email is not collected or used. Client users have a separate **Client portal** login tab and distinct account role.
 
 ## Authentication and authorization
